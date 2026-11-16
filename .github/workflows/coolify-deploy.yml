@@ -1,0 +1,71 @@
+name: Coolify deploy
+
+on:
+  workflow_call:
+    inputs:
+      app:
+        description: Coolify application uuid.
+        type: string
+        required: true
+      environment:
+        description: GitHub environment name. Each one gets its own row under the repo's Deployments.
+        type: string
+        required: true
+      url:
+        description: Live URL that the GitHub deployment links to.
+        type: string
+        default: ""
+      coolify-url:
+        type: string
+        default: https://coolify.lan
+      timeout-minutes:
+        type: number
+        default: 15
+    secrets:
+      COOLIFY_TOKEN:
+        description: Coolify API token with the deploy permission.
+        required: true
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, homelab]
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    concurrency:
+      group: coolify-${{ inputs.app }}
+      cancel-in-progress: false
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ inputs.url }}
+    steps:
+      - name: Deploy ${{ inputs.environment }} through Coolify
+        env:
+          COOLIFY: ${{ inputs.coolify-url }}
+          COOLIFY_TOKEN: ${{ secrets.COOLIFY_TOKEN }}
+          APP: ${{ inputs.app }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          api() { curl -fsS --retry 3 -H "Authorization: Bearer $COOLIFY_TOKEN" -H "Accept: application/json" "$@"; }
+          dep=$(api -X POST "$COOLIFY/api/v1/deploy?uuid=$APP&cancel_previous=queued" | jq -r '.deployments[0].deployment_uuid // empty')
+          [ -n "$dep" ] || { echo "::error::Coolify queued no deployment for $APP"; exit 1; }
+          echo "Coolify deployment $dep"
+          last=""
+          while :; do
+            body=$(api "$COOLIFY/api/v1/deployments/$dep")
+            status=$(jq -r '.status' <<<"$body")
+            [ "$status" = "$last" ] || echo "status: $status"
+            last=$status
+            case "$status" in
+              finished) break ;;
+              failed|cancelled|cancelled-by-user) echo "::error::Coolify deployment $dep ended $status"; exit 1 ;;
+            esac
+            sleep 5
+          done
+          commit=$(jq -r '.commit // ""' <<<"$body")
+          {
+            echo "### ${{ inputs.environment }}"
+            echo "Coolify deployment \`$dep\` finished with commit \`${commit:0:12}\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$commit" != "HEAD" ] && [ -n "$commit" ] && [ "$commit" != "$SHA" ]; then
+            echo "::warning::Coolify built ${commit:0:12}, not this run's ${SHA:0:12}. A newer push reached the branch first."
+          fi
