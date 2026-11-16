@@ -15,6 +15,10 @@ on:
         description: Live URL that the GitHub deployment links to.
         type: string
         default: ""
+      rollback-to:
+        description: Commit of an image Coolify still holds. Runs that image again instead of building the branch.
+        type: string
+        default: ""
       coolify-url:
         type: string
         default: https://coolify.lan
@@ -23,12 +27,12 @@ on:
         default: 15
     secrets:
       COOLIFY_TOKEN:
-        description: Coolify API token with the deploy permission.
+        description: Coolify API token with the read and deploy permissions.
         required: true
 
 jobs:
   deploy:
-    runs-on: [self-hosted, homelab]
+    runs-on: [self-hosted, homelab-deploy]
     timeout-minutes: ${{ inputs.timeout-minutes }}
     concurrency:
       group: coolify-${{ inputs.app }}
@@ -41,12 +45,30 @@ jobs:
         env:
           COOLIFY: ${{ inputs.coolify-url }}
           COOLIFY_TOKEN: ${{ secrets.COOLIFY_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           APP: ${{ inputs.app }}
+          ROLLBACK_TO: ${{ inputs.rollback-to }}
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           api() { curl -fsS --retry 3 -H "Authorization: Bearer $COOLIFY_TOKEN" -H "Accept: application/json" "$@"; }
-          dep=$(api -X POST "$COOLIFY/api/v1/deploy?uuid=$APP&cancel_previous=queued" | jq -r '.deployments[0].deployment_uuid // empty')
+          summary() { echo "$1" >> "$GITHUB_STEP_SUMMARY"; echo "$1"; }
+          if [ -n "$ROLLBACK_TO" ]; then
+            dep=$(api -X POST -H "Content-Type: application/json" -d "{\"commit\":\"$ROLLBACK_TO\"}" "$COOLIFY/api/v1/applications/$APP/rollback" | jq -r '.deployment_uuid // empty')
+            want=$ROLLBACK_TO
+          else
+            # The image Coolify runs now. When it already holds this run's commit, there is nothing to build.
+            current=$(api "$COOLIFY/api/v1/applications/$APP/rollback-images" | jq -r '.current // ""')
+            if [[ "$current" =~ ^[0-9a-f]{40}$ ]]; then
+              state=$(gh api "repos/$GITHUB_REPOSITORY/compare/$SHA...$current" --jq .status 2>/dev/null || true)
+              if [ "$state" = identical ] || [ "$state" = ahead ]; then
+                summary "Already live: Coolify runs \`${current:0:12}\`, which contains \`${SHA:0:12}\`. Nothing was built."
+                exit 0
+              fi
+            fi
+            dep=$(api -X POST "$COOLIFY/api/v1/deploy?uuid=$APP&cancel_previous=queued" | jq -r '.deployments[0].deployment_uuid // empty')
+            want=$SHA
+          fi
           [ -n "$dep" ] || { echo "::error::Coolify queued no deployment for $APP"; exit 1; }
           echo "Coolify deployment $dep"
           last=""
@@ -59,13 +81,10 @@ jobs:
               finished) break ;;
               failed|cancelled|cancelled-by-user) echo "::error::Coolify deployment $dep ended $status"; exit 1 ;;
             esac
-            sleep 5
+            sleep 2
           done
           commit=$(jq -r '.commit // ""' <<<"$body")
-          {
-            echo "### ${{ inputs.environment }}"
-            echo "Coolify deployment \`$dep\` finished with commit \`${commit:0:12}\`."
-          } >> "$GITHUB_STEP_SUMMARY"
-          if [ "$commit" != "HEAD" ] && [ -n "$commit" ] && [ "$commit" != "$SHA" ]; then
-            echo "::warning::Coolify built ${commit:0:12}, not this run's ${SHA:0:12}. A newer push reached the branch first."
+          summary "Coolify deployment \`$dep\` finished with commit \`${commit:0:12}\`${ROLLBACK_TO:+ (rollback, no build)}."
+          if [ -n "$commit" ] && [ "$commit" != "HEAD" ] && [ "$commit" != "$want" ]; then
+            echo "::warning::Coolify deployed ${commit:0:12}, not ${want:0:12}. A newer push reached the branch first."
           fi
