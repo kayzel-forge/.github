@@ -57,14 +57,18 @@ jobs:
             dep=$(api -X POST -H "Content-Type: application/json" -d "{\"commit\":\"$ROLLBACK_TO\"}" "$COOLIFY/api/v1/applications/$APP/rollback" | jq -r '.deployment_uuid // empty')
             want=$ROLLBACK_TO
           else
-            # The image Coolify runs now. When it already holds this run's commit, there is nothing to build.
-            current=$(api "$COOLIFY/api/v1/applications/$APP/rollback-images" | jq -r '.current // ""')
-            if [[ "$current" =~ ^[0-9a-f]{40}$ ]]; then
+            # The commit Coolify runs now, from its newest finished deployment. rollback-images says the same but takes 2 to 3 s.
+            # When that commit already contains this run's commit, there is nothing to build.
+            current=$(api "$COOLIFY/api/v1/deployments/applications/$APP?take=10" | jq -r '[.deployments[] | select(.status == "finished" and (.pull_request_id // 0) == 0)][0].commit // ""')
+            state=""
+            if [ "$current" = "$SHA" ]; then
+              state=identical
+            elif [[ "$current" =~ ^[0-9a-f]{40}$ ]]; then
               state=$(gh api "repos/$GITHUB_REPOSITORY/compare/$SHA...$current" --jq .status 2>/dev/null || true)
-              if [ "$state" = identical ] || [ "$state" = ahead ]; then
-                summary "Already live: Coolify runs \`${current:0:12}\`, which contains \`${SHA:0:12}\`. Nothing was built."
-                exit 0
-              fi
+            fi
+            if [ "$state" = identical ] || [ "$state" = ahead ]; then
+              summary "Already live: Coolify runs \`${current:0:12}\`, which contains \`${SHA:0:12}\`. Nothing was built."
+              exit 0
             fi
             dep=$(api -X POST "$COOLIFY/api/v1/deploy?uuid=$APP&cancel_previous=queued" | jq -r '.deployments[0].deployment_uuid // empty')
             want=$SHA
